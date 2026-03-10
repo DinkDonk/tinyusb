@@ -30,18 +30,18 @@
 #if CFG_TUSB_MCU == OPT_MCU_RP2040
 
 #include <stdlib.h>
-#include "rp2040_usb.h"
+#include "portable/raspberrypi/rp2040/rp2040_usb.h"
 
 //--------------------------------------------------------------------+
 // MACRO CONSTANT TYPEDEF PROTOTYPE
 //--------------------------------------------------------------------+
 static void sync_xfer(hw_endpoint_t *ep);
 
-  #if TUD_OPT_RP2040_USB_DEVICE_UFRAME_FIX
-static bool e15_is_critical_frame_period(struct hw_endpoint *ep);
-  #else
-    #define e15_is_critical_frame_period(x) (false)
-  #endif
+#if TUD_OPT_RP2040_USB_DEVICE_UFRAME_FIX
+  static bool e15_is_critical_frame_period(struct hw_endpoint *ep);
+#else
+  #define e15_is_critical_frame_period(x) (false)
+#endif
 
 //--------------------------------------------------------------------+
 // Implementation
@@ -55,12 +55,14 @@ static void unaligned_memcpy(uint8_t *dst, const uint8_t *src, size_t n) {
 
 void tu_hwfifo_write(volatile void *hwfifo, const uint8_t *src, uint16_t len, const tu_hwfifo_access_t *access_mode) {
   (void)access_mode;
-  unaligned_memcpy((uint8_t *)(uintptr_t)hwfifo, src, len);
+  volatile uint8_t *dst8 = (volatile uint8_t *)hwfifo;
+  while (len--) *dst8++ = *src++;
 }
 
 void tu_hwfifo_read(const volatile void *hwfifo, uint8_t *dest, uint16_t len, const tu_hwfifo_access_t *access_mode) {
   (void)access_mode;
-  unaligned_memcpy(dest, (const uint8_t *)(uintptr_t)hwfifo, len);
+  const volatile uint8_t *src8 = (const volatile uint8_t *)hwfifo;
+  while (len--) *dest++ = *src8++;
 }
 
 void rp2usb_init(void) {
@@ -115,7 +117,7 @@ void __tusb_irq_path_func(hwbuf_ctrl_update)(io_rw_32 *buf_ctrl_reg, uint32_t an
       // wait at least 1/48 mhz (usb clock), 12 cycles should be good for 48*12Mhz = 576Mhz.
       // Don't need delay in host mode as host is in charge
       if (!is_host) {
-        busy_wait_at_least_cycles(12);
+        busy_wait_us(1);
       }
     }
   }
@@ -341,28 +343,35 @@ static void __tusb_irq_path_func(sync_xfer)(hw_endpoint_t *ep) {
       // At this time (currently trigger per 2 buffer), the buffer1 is probably filled with data from
       // the next transfer (not current one). For now we disable double buffered for device OUT
       // NOTE this could happen to Host IN
-#if 0
       uint8_t const ep_num = tu_edpt_number(ep->ep_addr);
-      uint8_t const dir =  (uint8_t) tu_edpt_dir(ep->ep_addr);
-      uint8_t const ep_id = 2*ep_num + (dir ? 0 : 1);
+      uint8_t const dir_u8 = (uint8_t) tu_edpt_dir(ep->ep_addr);
+      uint8_t const ep_id  = 2*ep_num + (dir_u8 ? 0 : 1);
 
-      // abort queued transfer on buffer 1
-      usb_hw->abort |= TU_BIT(ep_id);
+      // Abort the still-armed buf1. Gate on B2+ chip where abort works;
+      // on B1 silicon the register has no effect but the buffer_control
+      // clear below is still safe.
+      #if CFG_TUH_ENABLED
+      const bool _is_host = rp2usb_is_host_mode();
+      #else
+      const bool _is_host = false;
+      #endif
+      if (!_is_host && rp2040_chip_version() >= 2) {
+        usb_hw_set->abort = TU_BIT(ep_id);
+        while (!(usb_hw->abort_done & TU_BIT(ep_id)))
+          tight_loop_contents();
+        usb_hw_clear->abort = TU_BIT(ep_id);
+      }
 
-      while ( !(usb_hw->abort_done & TU_BIT(ep_id)) ) {}
-
-      uint32_t ep_ctrl = *ep->endpoint_control;
+      // Switch back to single-buffer and zero buffer_control so the SIE
+      // cannot re-arm buf1 from stale DPRAM state.
+      uint32_t ep_ctrl = *ep_ctrl_reg;
       ep_ctrl &= ~(EP_CTRL_DOUBLE_BUFFERED_BITS | EP_CTRL_INTERRUPT_PER_DOUBLE_BUFFER);
       ep_ctrl |= EP_CTRL_INTERRUPT_PER_BUFFER;
-
-      io_rw_32 *buf_ctrl_reg = is_host ? hwbuf_ctrl_reg_host(ep) : hwbuf_ctrl_reg_device(ep);
+      *ep_ctrl_reg = ep_ctrl;
       hwbuf_ctrl_set(buf_ctrl_reg, 0);
-
-      usb_hw->abort &= ~TU_BIT(ep_id);
 
       TU_LOG(3, "----SHORT PACKET buffer0 on EP %02X:\r\n", ep->ep_addr);
       TU_LOG(3, "  BufCtrl: [0] = 0x%04x  [1] = 0x%04x\r\n", tu_u32_low16(buf_ctrl), tu_u32_high16(buf_ctrl));
-#endif
     }
   }
 }
